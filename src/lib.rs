@@ -28,9 +28,9 @@
 //! }
 //! ```
 
-use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
-use std::thread;
+use std::time::Duration;
+use std::fmt;
 
 static INIT: AtomicBool = ATOMIC_BOOL_INIT;
 
@@ -39,9 +39,16 @@ static INIT: AtomicBool = ATOMIC_BOOL_INIT;
 pub enum Error {
     /// Ctrl-C signal handler already registered.
     MultipleHandlers,
+    /// Wait timed out.
+    Timeout,
     /// Unexpected system error.
     System(std::io::Error),
 }
+
+/// Ctrl-C guard
+pub struct Guard(std::marker::PhantomData<*const usize>);
+
+unsafe impl Send for Guard {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -54,6 +61,7 @@ impl std::error::Error for Error {
     fn description(&self) -> &str {
         match *self {
             Error::MultipleHandlers => "Ctrl-C signal handler already registered",
+            Error::Timeout => "Wait timed out",
             Error::System(_) => "Unexpected system error",
         }
     }
@@ -98,7 +106,7 @@ mod platform {
     /// Will panic if a non recoverable system error occur.
     ///
     #[inline]
-    pub unsafe fn init_os_handler() -> Result<(), Error> {
+    pub unsafe fn register() -> Result<(), Error> {
         // Should only fail if invalid parameters, FD limit or out of memory.
         PIPE = unistd::pipe2(nix::fcntl::O_CLOEXEC).map_err(|e| Error::System(e.into()))?;
 
@@ -120,6 +128,10 @@ mod platform {
         Ok(())
     }
 
+    pub unsafe fn unregister() -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Blocks until a Ctrl-C signal is received.
     ///
     /// Must be called after calling [`init_os_handler()`](fn.init_os_handler.html).
@@ -128,7 +140,7 @@ mod platform {
     /// Will return an error if a system error occurs.
     ///
     #[inline]
-    pub unsafe fn block_ctrl_c() -> Result<(), Error> {
+    pub unsafe fn block() -> Result<(), Error> {
         let mut buf = [0u8];
 
         loop {
@@ -156,6 +168,7 @@ mod platform {
     use self::winapi::{HANDLE, BOOL, DWORD, TRUE, FALSE, c_long};
     use std::ptr;
     use std::io;
+    use std::time::Duration;
 
     const MAX_SEM_COUNT: c_long = 255;
     static mut SEMAPHORE: HANDLE = 0 as HANDLE;
@@ -179,7 +192,7 @@ mod platform {
     /// Will panic if a non recoverable system error occur.
     ///
     #[inline]
-    pub unsafe fn init_os_handler() -> Result<(), Error> {
+    pub unsafe fn register() -> Result<(), Error> {
         SEMAPHORE = self::kernel32::CreateSemaphoreA(ptr::null_mut(), 0, MAX_SEM_COUNT, ptr::null());
         if SEMAPHORE.is_null() {
             return Err(Error::System(io::Error::last_os_error()));
@@ -195,6 +208,17 @@ mod platform {
         Ok(())
     }
 
+    pub unsafe fn unregister() -> Result<(), Error> {
+        if self::kernel32::SetConsoleCtrlHandler(Some(os_handler), FALSE) == FALSE {
+            Err(Error::System(io::Error::last_os_error()))
+        } else {
+            // There might be race here.
+            self::kernel32::CloseHandle(SEMAPHORE);
+            SEMAPHORE = 0 as HANDLE;
+            Ok(())
+        }
+    }
+
     /// Blocks until a Ctrl-C signal is received.
     ///
     /// Must be called after calling [`init_os_handler()`](fn.init_os_handler.html).
@@ -203,16 +227,79 @@ mod platform {
     /// Will return an error if a system error occurs.
     ///
     #[inline]
-    pub unsafe fn block_ctrl_c() -> Result<(), Error> {
-        use self::winapi::{INFINITE, WAIT_OBJECT_0, WAIT_FAILED};
+    pub unsafe fn block(timeout: Option<Duration>) -> Result<(), Error> {
+        use self::winapi::{INFINITE, WAIT_OBJECT_0, WAIT_FAILED, WAIT_TIMEOUT};
 
-        match self::kernel32::WaitForSingleObject(SEMAPHORE, INFINITE) {
+        let time = if let Some(dur) = timeout {
+            let ms_sec = dur.as_secs().overflowing_mul(1000).0;
+            let ms_nano = dur.subsec_nanos() / 1000;
+            (ms_sec as DWORD) + (ms_nano as DWORD)
+        } else {
+            INFINITE
+        };
+
+        match self::kernel32::WaitForSingleObject(SEMAPHORE, time) {
             WAIT_OBJECT_0 => Ok(()),
             WAIT_FAILED => Err(Error::System(io::Error::last_os_error())),
+            WAIT_TIMEOUT => Err(Error::Timeout),
             ret => Err(Error::System(io::Error::new(
                 io::ErrorKind::Other,
                 format!("WaitForSingleObject(), unexpected return value \"{:x}\"", ret),
             ))),
+        }
+    }
+}
+
+impl Guard {
+    /// Register new Ctrl-C guard
+    pub fn register() -> Result<Guard, Error> {
+        if INIT.compare_and_swap(false, true, Ordering::SeqCst) {
+            return Err(Error::MultipleHandlers);
+        }
+
+        unsafe {
+            match platform::register() {
+                Ok(_) => Ok(Guard(std::marker::PhantomData)),
+                Err(e) => {
+                    INIT.store(false, Ordering::SeqCst);
+                    Err(e)
+                },
+            }
+        }
+    }
+
+    /// Blocks until a Ctrl-C signal is received.
+    pub fn block(&mut self) -> Result<(), Error> {
+        unsafe {
+            platform::block(None)
+        }
+    }
+
+    /// Blocks until a Ctrl-C signal is received or timeout.
+    pub fn block_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
+        unsafe {
+            platform::block(Some(timeout))
+        }
+    }
+
+    /// Unregister Ctrl-C guard
+    pub fn unregister(self) -> Result<(), Error> {
+        assert!(INIT.load(Ordering::SeqCst));
+        unsafe {
+            let res = platform::unregister();
+            INIT.store(false, Ordering::SeqCst);
+            res
+        }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if INIT.load(Ordering::SeqCst) {
+            unsafe {
+                platform::unregister().is_ok();
+                INIT.store(false, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -242,25 +329,10 @@ mod platform {
 pub fn set_handler<F>(user_handler: F) -> Result<(), Error>
     where F: Fn() -> () + 'static + Send
 {
-    if INIT.compare_and_swap(false, true, Ordering::SeqCst) {
-        return Err(Error::MultipleHandlers);
-    }
-
-    unsafe {
-        match platform::init_os_handler() {
-            Ok(_) => {},
-            err => {
-                INIT.store(false, Ordering::SeqCst);
-                return err;
-            },
-        }
-    }
-
-    thread::spawn(move || {
+    let mut guard = Guard::register()?;
+    std::thread::spawn(move || {
         loop {
-            unsafe {
-                platform::block_ctrl_c().expect("Critical system error while waiting for Ctrl-C");
-            }
+            guard.block().expect("Critical system error while waiting for Ctrl-C");
             user_handler();
         }
     });

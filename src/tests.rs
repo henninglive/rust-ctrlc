@@ -218,6 +218,46 @@ mod platform {
     }
 }
 
+fn test_guard_timeout() {
+    let mut guard = ctrlc::Guard::register().unwrap();
+
+    let mut start = std::time::Instant::now();
+    match guard.block_timeout(std::time::Duration::from_secs(2)) {
+        Err(ctrlc::Error::Timeout) => {},
+        e => panic!("{:?}", e),
+    }
+
+    let mut dur = start.elapsed();
+    let mut elp = dur.as_secs() as f64 + (dur.subsec_nanos() as f64) / 1000000.0;
+    assert!(elp > 1.5, "elapsed:{}", elp);
+
+    start = std::time::Instant::now();
+    let t = std::thread::spawn(move || {
+        guard.block_timeout(std::time::Duration::from_secs(2)).unwrap();
+    });
+
+    unsafe { platform::raise_ctrl_c(); }
+    t.join().unwrap();
+
+    dur = start.elapsed();
+    elp = dur.as_secs() as f64 + (dur.subsec_nanos() as f64) / 1000000.0;
+    assert!(elp < 1.5, "elapsed:{}", elp);
+}
+
+fn test_guard_drop() {
+    {
+        let guard = ctrlc::Guard::register().unwrap();
+        guard.unregister().unwrap();
+    }
+    {
+        let _ = ctrlc::Guard::register().unwrap();
+    }
+    {
+        let guard = ctrlc::Guard::register().unwrap();
+        guard.unregister().unwrap();
+    }
+}
+
 fn test_set_handler() {
     let (tx, rx) = ::std::sync::mpsc::channel();
     ctrlc::set_handler(move || {
@@ -257,7 +297,11 @@ fn main() {
         (default)(info);
     }));
 
-    run_tests!(test_set_handler);
+    run_tests!(
+        test_guard_drop,
+        test_guard_timeout,
+        test_set_handler
+    );
 
     unsafe { platform::cleanup().unwrap(); }
 }
