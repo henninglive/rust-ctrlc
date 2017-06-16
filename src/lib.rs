@@ -34,6 +34,17 @@ use std::fmt;
 
 static INIT: AtomicBool = ATOMIC_BOOL_INIT;
 
+#[allow(missing_docs)]
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum CtrlEvent {
+    CTRL_C,
+    CTRL_BREAK,
+    SIGINT,
+    SIGTERM,
+}
+
 /// Ctrl-C error.
 #[derive(Debug)]
 pub enum Error {
@@ -164,19 +175,38 @@ mod platform {
     extern crate winapi;
     extern crate kernel32;
 
-    use super::Error;
-    use self::winapi::{HANDLE, BOOL, DWORD, TRUE, FALSE, c_long};
-    use std::ptr;
-    use std::io;
+    use super::{Error, CtrlEvent};
+    use self::winapi::{BOOL, DWORD, TRUE, FALSE};
+    use std::sync::mpsc::{Sender, Receiver, RecvTimeoutError};
     use std::time::Duration;
+    use std::sync::Mutex;
+    use std::io;
 
-    const MAX_SEM_COUNT: c_long = 255;
-    static mut SEMAPHORE: HANDLE = 0 as HANDLE;
+    static mut TX: *mut Mutex<Sender<CtrlEvent>> = 0 as *mut Mutex<Sender<CtrlEvent>>;
+    static mut RX: *mut Mutex<Receiver<CtrlEvent>> = 0 as *mut Mutex<Receiver<CtrlEvent>>;
 
-    unsafe extern "system" fn os_handler(_: DWORD) -> BOOL {
-        // Assuming this always succeeds. Can't really handle errors in any meaningful way.
-        self::kernel32::ReleaseSemaphore(SEMAPHORE, 1, ptr::null_mut());
+    unsafe extern "system" fn os_handler(ctrl_type: DWORD) -> BOOL {
+        use self::winapi::wincon::{CTRL_C_EVENT, CTRL_BREAK_EVENT};
+
+        let event = match ctrl_type {
+            CTRL_C_EVENT => CtrlEvent::CTRL_C,
+            CTRL_BREAK_EVENT => CtrlEvent::CTRL_BREAK,
+            _ => return FALSE,
+        };
+
+        match (*TX).lock() {
+            Ok(tx) => { tx.send(event).is_ok(); },
+            Err(_) => {},
+        }
+
         TRUE
+    }
+
+    unsafe fn drop_channel() {
+        Box::from_raw(TX);
+        Box::from_raw(RX);
+        TX = 0 as *mut Mutex<Sender<CtrlEvent>>;
+        RX = 0 as *mut Mutex<Receiver<CtrlEvent>>;
     }
 
     /// Register os signal handler.
@@ -193,15 +223,13 @@ mod platform {
     ///
     #[inline]
     pub unsafe fn register() -> Result<(), Error> {
-        SEMAPHORE = self::kernel32::CreateSemaphoreA(ptr::null_mut(), 0, MAX_SEM_COUNT, ptr::null());
-        if SEMAPHORE.is_null() {
-            return Err(Error::System(io::Error::last_os_error()));
-        }
+        let (tx, rx) = ::std::sync::mpsc::channel();
+        TX = Box::into_raw(Box::new(Mutex::new(tx)));
+        RX = Box::into_raw(Box::new(Mutex::new(rx)));
 
         if self::kernel32::SetConsoleCtrlHandler(Some(os_handler), TRUE) == FALSE {
             let e = io::Error::last_os_error();
-            self::kernel32::CloseHandle(SEMAPHORE);
-            SEMAPHORE = 0 as HANDLE;
+            drop_channel();
             return Err(Error::System(e));
         }
 
@@ -209,14 +237,14 @@ mod platform {
     }
 
     pub unsafe fn unregister() -> Result<(), Error> {
-        if self::kernel32::SetConsoleCtrlHandler(Some(os_handler), FALSE) == FALSE {
+        let ret = if self::kernel32::SetConsoleCtrlHandler(Some(os_handler), FALSE) == FALSE {
             Err(Error::System(io::Error::last_os_error()))
         } else {
-            // There might be race here.
-            self::kernel32::CloseHandle(SEMAPHORE);
-            SEMAPHORE = 0 as HANDLE;
             Ok(())
-        }
+        };
+
+        drop_channel();
+        ret
     }
 
     /// Blocks until a Ctrl-C signal is received.
@@ -227,25 +255,17 @@ mod platform {
     /// Will return an error if a system error occurs.
     ///
     #[inline]
-    pub unsafe fn block(timeout: Option<Duration>) -> Result<(), Error> {
-        use self::winapi::{INFINITE, WAIT_OBJECT_0, WAIT_FAILED, WAIT_TIMEOUT};
-
-        let time = if let Some(dur) = timeout {
-            let ms_sec = dur.as_secs().overflowing_mul(1000).0;
-            let ms_nano = dur.subsec_nanos() / 1000;
-            (ms_sec as DWORD) + (ms_nano as DWORD)
-        } else {
-            INFINITE
-        };
-
-        match self::kernel32::WaitForSingleObject(SEMAPHORE, time) {
-            WAIT_OBJECT_0 => Ok(()),
-            WAIT_FAILED => Err(Error::System(io::Error::last_os_error())),
-            WAIT_TIMEOUT => Err(Error::Timeout),
-            ret => Err(Error::System(io::Error::new(
-                io::ErrorKind::Other,
-                format!("WaitForSingleObject(), unexpected return value \"{:x}\"", ret),
-            ))),
+    pub unsafe fn block(timeout: Option<Duration>) -> Result<CtrlEvent, Error> {
+        let rx = (*RX).lock().unwrap();
+        match timeout {
+            Some(t) => {
+                match rx.recv_timeout(t) {
+                    Err(RecvTimeoutError::Timeout) => Err(Error::Timeout),
+                    Err(RecvTimeoutError::Disconnected) => panic!(),
+                    Ok(sig) => Ok(sig),
+                }
+            }
+            None => Ok(rx.recv().unwrap()),
         }
     }
 }
@@ -269,14 +289,14 @@ impl Guard {
     }
 
     /// Blocks until a Ctrl-C signal is received.
-    pub fn block(&mut self) -> Result<(), Error> {
+    pub fn block(&mut self) -> Result<CtrlEvent, Error> {
         unsafe {
             platform::block(None)
         }
     }
 
     /// Blocks until a Ctrl-C signal is received or timeout.
-    pub fn block_timeout(&mut self, timeout: Duration) -> Result<(), Error> {
+    pub fn block_timeout(&mut self, timeout: Duration) -> Result<CtrlEvent, Error> {
         unsafe {
             platform::block(Some(timeout))
         }
